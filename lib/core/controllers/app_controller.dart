@@ -39,6 +39,9 @@ class AppController {
 
   bool _initialized = false;
 
+  /// Called when a new match is created. UI layer sets this to update Riverpod state.
+  void Function(String peerId)? onMatchCreated;
+
   /// In-memory peer name cache to avoid DB lookups on every notification.
   final Map<String, String> _peerNameCache = {};
 
@@ -497,6 +500,7 @@ class AppController {
     // Fire match notification
     final peerName = _getPeerName(peerId);
     await _notifications.showMatchNotification(peerName);
+    onMatchCreated?.call(peerId);
   }
 
   /// Stores a remote peer's public key from a wave/waveAccept data field.

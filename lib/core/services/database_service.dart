@@ -463,7 +463,7 @@ class DatabaseService {
   Future<List<BroadcastMessage>> getBroadcasts(int limit) async {
     final rows = await _database.query(
       'broadcast_messages',
-      orderBy: 'timestamp DESC',
+      orderBy: 'timestamp ASC',
       limit: limit,
     );
     return rows.map((r) => BroadcastMessage.fromDbJson(r)).toList();

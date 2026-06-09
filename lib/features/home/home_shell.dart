@@ -33,6 +33,10 @@ class _HomeShellState extends ConsumerState<HomeShell>
       final localProfile = ref.read(localProfileProvider);
       if (localProfile != null) {
         ref.read(appControllerProvider).initialize(localProfile.deviceId);
+        ref.read(appControllerProvider).onMatchCreated = (peerId) {
+          ref.read(newMatchProvider.notifier).state = peerId;
+          ref.invalidate(matchesProvider);
+        };
       }
     });
   }

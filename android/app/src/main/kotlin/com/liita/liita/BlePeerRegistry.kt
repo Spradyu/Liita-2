@@ -14,6 +14,9 @@ class BlePeerRegistry {
     // Track discovered peers (Profile JSON) for the EventChannel
     private val discoveredPeers = ConcurrentHashMap<String, String>()
 
+    // Track all known BluetoothDevice objects for ephemeral connections
+    private val knownDevices = ConcurrentHashMap<String, BluetoothDevice>()
+
     fun addConnection(gatt: BluetoothGatt) {
         connectedGatts[gatt.device.address] = gatt
     }
@@ -24,6 +27,14 @@ class BlePeerRegistry {
 
     fun getAllConnections(): List<BluetoothGatt> {
         return connectedGatts.values.toList()
+    }
+
+    fun addKnownDevice(device: BluetoothDevice) {
+        knownDevices[device.address] = device
+    }
+
+    fun getAllKnownDevices(): List<BluetoothDevice> {
+        return knownDevices.values.toList()
     }
     
     fun updatePeerProfile(deviceId: String, profileJson: String): Boolean {
@@ -44,5 +55,6 @@ class BlePeerRegistry {
         }
         connectedGatts.clear()
         discoveredPeers.clear()
+        knownDevices.clear()
     }
 }

@@ -252,16 +252,45 @@ class MeshForegroundService : Service() {
         val payloadStr = Utils.compressAndEncode(jsonStr)
         val payloadBytes = payloadStr.toByteArray(Charsets.UTF_8)
 
-        val connections = peerRegistry.getAllConnections()
-        for (gatt in connections) {
-            val service = gatt.getService(SERVICE_UUID)
-            val char = service?.getCharacteristic(PROFILE_CHAR_UUID)
-            if (char != null) {
-                writeQueue.add(WriteRequest(gatt, payloadBytes))
-                Log.d("LiitaBLE", "[LiitaBLE] write queued for ${gatt.device.address}, queue size=${writeQueue.size}")
-            }
+        // Grab all known devices we've discovered, not just currently connected ones
+        val knownDevices = peerRegistry.getAllKnownDevices() 
+
+        for (device in knownDevices) {
+            // Spin up a temporary GATT client just for this packet transmission
+            device.connectGatt(this, false, object : BluetoothGattCallback() {
+                
+                override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                    if (newState == BluetoothProfile.STATE_CONNECTED) {
+                        Log.d("LiitaBLE", "[LiitaBLE] Ephemeral connect to ${device.address}")
+                        gatt.discoverServices()
+                    } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                        gatt.close()
+                    }
+                }
+
+                override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        val service = gatt.getService(SERVICE_UUID)
+                        val char = service?.getCharacteristic(PROFILE_CHAR_UUID)
+                        
+                        if (char != null) {
+                            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                            char.value = payloadBytes
+                            gatt.writeCharacteristic(char)
+                        } else {
+                            gatt.disconnect()
+                        }
+                    } else {
+                        gatt.disconnect()
+                    }
+                }
+
+                override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                    Log.d("LiitaBLE", "[LiitaBLE] Packet successfully fired to ${gatt.device.address}. Disconnecting.")
+                    gatt.disconnect()
+                }
+            })
         }
-        drainWriteQueue()
     }
 
     @SuppressLint("MissingPermission")
@@ -456,6 +485,7 @@ class MeshForegroundService : Service() {
             if (!hasPermissions()) return
             val device = result.device
             val address = device.address
+            peerRegistry.addKnownDevice(device)
 
             val uuids = result.scanRecord?.serviceUuids?.joinToString { it.uuid.toString() } ?: "none"
             Log.d("LiitaBLE", "[LiitaBLE] scan callback hit: device=$address, uuids=$uuids")
@@ -558,9 +588,6 @@ class MeshForegroundService : Service() {
                     Log.d("LiitaBLE", "[LiitaBLE] peer discovered via GATT read: $deviceId")
                     onPeerDiscovered?.invoke(profileJson)
                 }
-                // Disconnect to free GATT slot (Android limit ~7 concurrent)
-                Log.d("LiitaBLE", "[LiitaBLE] disconnecting from $address after profile read")
-                if (hasPermissions()) gatt.disconnect()
             } else {
                 Log.e("LiitaBLE", "[LiitaBLE] characteristic read failed for $address, status=$status")
             }

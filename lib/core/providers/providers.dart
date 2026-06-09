@@ -35,12 +35,14 @@ final cryptoServiceProvider = Provider<CryptoService>((ref) {
 });
 
 final appControllerProvider = Provider<AppController>((ref) {
-  return AppController(
+  final controller = AppController(
     db: ref.watch(databaseServiceProvider),
     mesh: ref.watch(meshServiceProvider),
     crypto: ref.watch(cryptoServiceProvider),
     notifications: ref.watch(notificationServiceProvider),
   );
+  ref.onDispose(controller.dispose);
+  return controller;
 });
 
 // ---------------------------------------------------------------------------
