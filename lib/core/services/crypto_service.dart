@@ -80,6 +80,14 @@ abstract class CryptoService {
 
   /// Return the public key corresponding to the stored private key.
   Future<ECPublicKey> getPublicKey();
+
+  /// Retires the current identity: clears the persisted device ID, private
+  /// key, and the in-memory shared-key cache, so the next
+  /// getOrCreatePrivateKey()/getOrCreateDeviceId() call generates a
+  /// completely unrelated keypair. Used by "End Flight Session" — a peer
+  /// who kept our old public key can no longer derive a shared secret with
+  /// us afterward.
+  Future<void> resetIdentity();
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +336,18 @@ class CryptoServiceImpl implements CryptoService {
     // A cold cache (after restart) is repopulated by deterministic
     // re-derivation in AppController, not by reading persisted state.
     return _sharedKeyCache[matchId];
+  }
+
+  // -----------------------------------------------------------------------
+  // Identity reset
+  // -----------------------------------------------------------------------
+
+  @override
+  Future<void> resetIdentity() async {
+    await _storage.delete(key: AppConstants.keyDeviceId);
+    await _storage.delete(key: AppConstants.keyPrivateKey);
+    await _storage.delete(key: AppConstants.keyPublicKey);
+    _sharedKeyCache.clear();
   }
 
   // -----------------------------------------------------------------------

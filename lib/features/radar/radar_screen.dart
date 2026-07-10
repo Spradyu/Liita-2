@@ -32,10 +32,23 @@ class _RadarScreenState extends ConsumerState<RadarScreen> {
     // Merge live discovered peers with peers we've waved at (loaded from the DB)
     // so a waved peer's card persists even when they're offline or after the app
     // restarts. Non-waved peers come only from the live stream.
+    //
+    // A LIVE peer's profile carries the photo path from *their* device (served
+    // over GATT) — meaningless here. The reassembled avatar lives in the DB
+    // profile (wavedProfiles). So when a peer is both live and known, keep the
+    // live profile but take its photoHash from the DB copy; otherwise the radar
+    // card would show initials even though we have their photo (and it would
+    // flash in on restart, then vanish once live discovery re-emits them).
     final livePeers = peersAsync.valueOrNull ?? const <UserProfile>[];
-    final byId = <String, UserProfile>{
-      for (final p in livePeers) p.deviceId: p,
+    final wavedById = <String, UserProfile>{
+      for (final p in wavedProfiles) p.deviceId: p,
     };
+    final byId = <String, UserProfile>{};
+    for (final p in livePeers) {
+      final dbPhoto = wavedById[p.deviceId]?.photoHash;
+      byId[p.deviceId] =
+          (dbPhoto != null && dbPhoto.isNotEmpty) ? p.copyWith(photoHash: dbPhoto) : p;
+    }
     for (final p in wavedProfiles) {
       byId.putIfAbsent(p.deviceId, () => p);
     }

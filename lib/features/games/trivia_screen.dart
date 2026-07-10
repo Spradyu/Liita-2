@@ -19,7 +19,6 @@ class TriviaScreen extends ConsumerStatefulWidget {
 
 class _TriviaScreenState extends ConsumerState<TriviaScreen>
     with SingleTickerProviderStateMixin {
-
   static const int _questionSeconds = 15;
   static const int _waitWatchdogSeconds = 20;
 
@@ -66,6 +65,11 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
   void _startQuestionTimer() {
     _questionTimer?.cancel();
     _waitWatchdog?.cancel();
+    // Cancel any pending result-display timer. A new question means the
+    // previous round's 2s auto-advance is void — if it were left to fire, it
+    // would call acknowledgeResult() and wipe the question that just arrived
+    // (the race that froze the game on Q2+ / showed "connection lost").
+    _resultTimer?.cancel();
     _timerExpiredHandled = false;
     _tappedIndex = null;
     _stalled = false;
@@ -74,7 +78,10 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
     _timerAnim.forward(from: 0.0);
 
     _questionTimer = Timer.periodic(const Duration(seconds: 1), (t) {
-      if (!mounted) { t.cancel(); return; }
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
       setState(() => _secondsLeft--);
       if (_secondsLeft <= 0) {
         t.cancel();
@@ -89,7 +96,9 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
   void _startWaitWatchdog() {
     _waitWatchdog?.cancel();
     _waitWatchdog = Timer(
-        const Duration(seconds: _waitWatchdogSeconds), _onWaitWatchdogFired);
+      const Duration(seconds: _waitWatchdogSeconds),
+      _onWaitWatchdogFired,
+    );
   }
 
   void _stopTimers() {
@@ -136,12 +145,20 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
 
   void _startResultTimer() {
     _resultTimer?.cancel();
-    _resultTimer = Timer(const Duration(milliseconds: 2000), _onResultTimerDone);
+    _resultTimer = Timer(
+      const Duration(milliseconds: 2000),
+      _onResultTimerDone,
+    );
   }
 
   void _onResultTimerDone() {
     final state = ref.read(triviaGameProvider);
     if (state == null || !mounted) return;
+    // Only advance if we're still actually showing the result. If the next
+    // question (or an end packet) already moved us on, this is a stale timer
+    // firing late — acting on it would wipe the current question and desync
+    // the two players.
+    if (state.phase != TriviaPhase.showingResult) return;
 
     if (state.isHost) {
       final nextQuestion =
@@ -164,18 +181,20 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
   void _sendAnswerPacket(int answerIndex) {
     final state = ref.read(triviaGameProvider);
     if (state == null) return;
-    ref.read(appControllerProvider).sendGameMessage(
-      state.opponentId,
-      GameMessage(
-        gameId: state.gameId,
-        gameType: GameType.trivia,
-        type: GameMessageType.answer,
-        payload: {
-          'selectedIndex': answerIndex,
-          'questionIndex': state.currentQuestionIndex,
-        },
-      ),
-    );
+    ref
+        .read(appControllerProvider)
+        .sendGameMessage(
+          state.opponentId,
+          GameMessage(
+            gameId: state.gameId,
+            gameType: GameType.trivia,
+            type: GameMessageType.answer,
+            payload: {
+              'selectedIndex': answerIndex,
+              'questionIndex': state.currentQuestionIndex,
+            },
+          ),
+        );
   }
 
   void _sendQuestionPacket(Map<String, dynamic> question, int index) {
@@ -184,46 +203,73 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
     // Strip the correct-answer index before it goes over the wire — the
     // opponent must not learn it until the result is revealed.
     final sanitized = Map<String, dynamic>.from(question)..remove('answer');
-    ref.read(appControllerProvider).sendGameMessage(
-      state.opponentId,
-      GameMessage(
-        gameId: state.gameId,
-        gameType: GameType.trivia,
-        type: GameMessageType.question,
-        payload: {'question': sanitized, 'index': index},
-      ),
-    );
+    ref
+        .read(appControllerProvider)
+        .sendGameMessage(
+          state.opponentId,
+          GameMessage(
+            gameId: state.gameId,
+            gameType: GameType.trivia,
+            type: GameMessageType.question,
+            payload: {'question': sanitized, 'index': index},
+          ),
+        );
   }
 
   void _sendResultPacket(Map<String, dynamic> resultPayload) {
     final state = ref.read(triviaGameProvider);
     if (state == null) return;
-    ref.read(appControllerProvider).sendGameMessage(
-      state.opponentId,
-      GameMessage(
-        gameId: state.gameId,
-        gameType: GameType.trivia,
-        type: GameMessageType.result,
-        payload: resultPayload,
-      ),
-    );
+    ref
+        .read(appControllerProvider)
+        .sendGameMessage(
+          state.opponentId,
+          GameMessage(
+            gameId: state.gameId,
+            gameType: GameType.trivia,
+            type: GameMessageType.result,
+            payload: resultPayload,
+          ),
+        );
   }
 
+  /// Sends the 'end' packet. Called on a natural finish (always by the host)
+  /// and on a manual quit (either party) — so the score fields are labeled
+  /// by role, not by "mine"/"theirs", which would swap host/opponent scores
+  /// when the non-host is the one quitting.
   void _sendEndPacket() {
     final state = ref.read(triviaGameProvider);
     if (state == null) return;
-    ref.read(appControllerProvider).sendGameMessage(
-      state.opponentId,
-      GameMessage(
-        gameId: state.gameId,
-        gameType: GameType.trivia,
-        type: GameMessageType.end,
-        payload: {
-          'hostScore': state.myScore,
-          'opponentScore': state.opponentScore,
-        },
-      ),
-    );
+    ref
+        .read(appControllerProvider)
+        .sendGameMessage(
+          state.opponentId,
+          GameMessage(
+            gameId: state.gameId,
+            gameType: GameType.trivia,
+            type: GameMessageType.end,
+            payload: {
+              'hostScore': state.isHost ? state.myScore : state.opponentScore,
+              'opponentScore':
+                  state.isHost ? state.opponentScore : state.myScore,
+            },
+          ),
+        );
+  }
+
+  /// Leaves the game at any point (mid-round or not): notifies the peer so
+  /// their screen doesn't get left stranded/stale, then resets locally.
+  void _quitGame() {
+    _stopTimers();
+    _resultTimer?.cancel();
+    final gameId = ref.read(triviaGameProvider)?.gameId;
+    // Drop any pending answers/questions for this game before sending the end,
+    // so stale packets stop retransmitting but the end itself still goes out.
+    if (gameId != null) {
+      ref.read(appControllerProvider).cancelPendingGameSends(gameId);
+    }
+    _sendEndPacket();
+    ref.read(triviaGameProvider.notifier).reset();
+    context.go('/matches');
   }
 
   // ── User taps an answer ────────────────────────────────────────────────────
@@ -315,41 +361,57 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
           ),
         ),
         body: const Center(
-          child: Text('Game not found',
-              style: TextStyle(color: AppColors.textSecondary)),
+          child: Text(
+            'Game not found',
+            style: TextStyle(color: AppColors.textSecondary),
+          ),
         ),
       );
     }
 
-    return Scaffold(
-      backgroundColor: AppColors.background,
-      appBar: AppBar(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _quitGame();
+      },
+      child: Scaffold(
         backgroundColor: AppColors.background,
-        elevation: 0,
-        automaticallyImplyLeading: false,
-        centerTitle: true,
-        title: Text(
-          'Cabin Trivia  vs  ${state.opponentName}',
-          style: const TextStyle(
+        appBar: AppBar(
+          backgroundColor: AppColors.background,
+          elevation: 0,
+          leading: IconButton(
+            icon: const Icon(
+              Icons.close_rounded,
+              color: AppColors.textSecondary,
+            ),
+            onPressed: _quitGame,
+          ),
+          centerTitle: true,
+          title: Text(
+            'Cabin Trivia  vs  ${state.opponentName}',
+            style: const TextStyle(
               color: AppColors.textPrimary,
               fontSize: 17,
-              fontWeight: FontWeight.w500),
-        ),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 16),
-            child: Center(
-              child: Text(
-                '${state.currentQuestionIndex + 1} / ${state.totalQuestions}',
-                style: const TextStyle(
-                    color: AppColors.textTertiary, fontSize: 13),
-              ),
+              fontWeight: FontWeight.w500,
             ),
           ),
-        ],
-      ),
-      body: SafeArea(
-        child: _buildBody(state),
+          actions: [
+            Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Center(
+                child: Text(
+                  '${state.currentQuestionIndex + 1} / ${state.totalQuestions}',
+                  style: const TextStyle(
+                    color: AppColors.textTertiary,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        body: SafeArea(child: _buildBody(state)),
       ),
     );
   }
@@ -366,11 +428,17 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
       case TriviaPhase.waitingForQuestion:
         return _buildWaiting('Get ready for the next question...');
       case TriviaPhase.waitingForOpponent:
-        return _buildQuestion(state, locked: true,
-            statusText: 'Waiting for ${state.opponentName}...');
+        return _buildQuestion(
+          state,
+          locked: true,
+          statusText: 'Waiting for ${state.opponentName}...',
+        );
       case TriviaPhase.waitingForResult:
-        return _buildQuestion(state, locked: true,
-            statusText: 'Answer sent — waiting for result...');
+        return _buildQuestion(
+          state,
+          locked: true,
+          statusText: 'Answer sent — waiting for result...',
+        );
       case TriviaPhase.answering:
         return _buildQuestion(state, locked: false, statusText: null);
       case TriviaPhase.showingResult:
@@ -397,7 +465,9 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
           Text(
             message,
             style: const TextStyle(
-                color: AppColors.textSecondary, fontSize: 15),
+              color: AppColors.textSecondary,
+              fontSize: 15,
+            ),
             textAlign: TextAlign.center,
           ),
         ],
@@ -416,7 +486,11 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.wifi_off_rounded, color: AppColors.error, size: 36),
+            const Icon(
+              Icons.wifi_off_rounded,
+              color: AppColors.error,
+              size: 36,
+            ),
             const SizedBox(height: 16),
             const Text(
               'Connection lost',
@@ -430,24 +504,24 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
             Text(
               "The next packet from ${state.opponentName} never arrived.",
               textAlign: TextAlign.center,
-              style: const TextStyle(color: AppColors.textTertiary, fontSize: 14),
+              style: const TextStyle(
+                color: AppColors.textTertiary,
+                fontSize: 14,
+              ),
             ),
             const SizedBox(height: 24),
-            OutlinedButton(
-              onPressed: () {
-                ref.read(triviaGameProvider.notifier).reset();
-                context.go('/matches');
-              },
-              child: const Text('Exit'),
-            ),
+            OutlinedButton(onPressed: _quitGame, child: const Text('Exit')),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildQuestion(TriviaGameState state,
-      {required bool locked, required String? statusText}) {
+  Widget _buildQuestion(
+    TriviaGameState state, {
+    required bool locked,
+    required String? statusText,
+  }) {
     final question = state.currentQuestion;
     if (question == null) return _buildWaiting('Loading question...');
 
@@ -478,22 +552,26 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
                 children: [
                   AnimatedBuilder(
                     animation: _timerAnim,
-                    builder: (_, __) => CircularProgressIndicator(
-                      value: 1.0 - _timerAnim.value,
-                      color: _secondsLeft <= 5
-                          ? AppColors.error
-                          : AppColors.primary,
-                      backgroundColor:
-                          AppColors.primary.withValues(alpha: 0.15),
-                      strokeWidth: 4,
-                    ),
+                    builder:
+                        (_, __) => CircularProgressIndicator(
+                          value: 1.0 - _timerAnim.value,
+                          color:
+                              _secondsLeft <= 5
+                                  ? AppColors.error
+                                  : AppColors.primary,
+                          backgroundColor: AppColors.primary.withValues(
+                            alpha: 0.15,
+                          ),
+                          strokeWidth: 4,
+                        ),
                   ),
                   Text(
                     '$_secondsLeft',
                     style: TextStyle(
-                      color: _secondsLeft <= 5
-                          ? AppColors.error
-                          : AppColors.textPrimary,
+                      color:
+                          _secondsLeft <= 5
+                              ? AppColors.error
+                              : AppColors.textPrimary,
                       fontSize: 20,
                       fontWeight: FontWeight.bold,
                     ),
@@ -529,13 +607,15 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
               children: List.generate(4, (i) {
                 final isSelected = _tappedIndex == i;
                 return GestureDetector(
-                  onTap: locked || _tappedIndex != null
-                      ? null
-                      : () => _onAnswerTapped(i),
+                  onTap:
+                      locked || _tappedIndex != null
+                          ? null
+                          : () => _onAnswerTapped(i),
                   child: Neumorphic(
                     style: NeumorphicStyle(
                       boxShape: NeumorphicBoxShape.roundRect(
-                          BorderRadius.circular(14)),
+                        BorderRadius.circular(14),
+                      ),
                       depth: isSelected ? -4 : 4,
                       color: isSelected ? NeuDark.accent : NeuDark.base,
                     ),
@@ -546,18 +626,20 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
                           width: 24,
                           height: 24,
                           decoration: BoxDecoration(
-                            color: isSelected
-                                ? Colors.white.withValues(alpha: 0.25)
-                                : AppColors.surfaceLight,
+                            color:
+                                isSelected
+                                    ? Colors.white.withValues(alpha: 0.25)
+                                    : AppColors.surfaceLight,
                             shape: BoxShape.circle,
                           ),
                           alignment: Alignment.center,
                           child: Text(
                             labels[i],
                             style: TextStyle(
-                              color: isSelected
-                                  ? Colors.white
-                                  : NeuDark.accentBright,
+                              color:
+                                  isSelected
+                                      ? Colors.white
+                                      : NeuDark.accentBright,
                               fontSize: 11,
                               fontWeight: FontWeight.bold,
                             ),
@@ -568,9 +650,10 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
                           child: Text(
                             options[i],
                             style: TextStyle(
-                              color: isSelected
-                                  ? Colors.white
-                                  : AppColors.textSecondary,
+                              color:
+                                  isSelected
+                                      ? Colors.white
+                                      : AppColors.textSecondary,
                               fontSize: 12,
                               height: 1.3,
                             ),
@@ -589,7 +672,9 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
               child: Text(
                 statusText,
                 style: const TextStyle(
-                    color: AppColors.textTertiary, fontSize: 13),
+                  color: AppColors.textTertiary,
+                  fontSize: 13,
+                ),
               ),
             ),
         ],
@@ -623,23 +708,25 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
             width: double.infinity,
             padding: const EdgeInsets.symmetric(vertical: 14),
             decoration: BoxDecoration(
-              color: iGotItRight
-                  ? const Color(0xFF1A3A2A)
-                  : const Color(0xFF3A1A1A),
+              color:
+                  iGotItRight
+                      ? const Color(0xFF1A3A2A)
+                      : const Color(0xFF3A1A1A),
               borderRadius: BorderRadius.circular(14),
               border: Border.all(
-                color: iGotItRight
-                    ? const Color(0xFF2ECC71).withValues(alpha: 0.4)
-                    : AppColors.error.withValues(alpha: 0.4),
+                color:
+                    iGotItRight
+                        ? const Color(0xFF2ECC71).withValues(alpha: 0.4)
+                        : AppColors.error.withValues(alpha: 0.4),
               ),
             ),
             alignment: Alignment.center,
             child: Text(
-              iGotItRight ? 'Correct' : (myAnswer == -1 ? 'Time\'s up' : 'Wrong'),
+              iGotItRight
+                  ? 'Correct'
+                  : (myAnswer == -1 ? 'Time\'s up' : 'Wrong'),
               style: TextStyle(
-                color: iGotItRight
-                    ? const Color(0xFF2ECC71)
-                    : AppColors.error,
+                color: iGotItRight ? const Color(0xFF2ECC71) : AppColors.error,
                 fontSize: 18,
                 fontWeight: FontWeight.w600,
               ),
@@ -650,7 +737,10 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
           Text(
             question['q'] as String,
             style: const TextStyle(
-                color: AppColors.textSecondary, fontSize: 15, height: 1.4),
+              color: AppColors.textSecondary,
+              fontSize: 15,
+              height: 1.4,
+            ),
           ),
           const SizedBox(height: 16),
 
@@ -669,8 +759,7 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
             }
             return Container(
               margin: const EdgeInsets.only(bottom: 8),
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
               decoration: BoxDecoration(
                 color: bgColor,
                 borderRadius: BorderRadius.circular(12),
@@ -679,9 +768,10 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
               child: Text(
                 options[i],
                 style: TextStyle(
-                  color: isCorrect
-                      ? const Color(0xFF2ECC71)
-                      : isMyWrongAnswer
+                  color:
+                      isCorrect
+                          ? const Color(0xFF2ECC71)
+                          : isMyWrongAnswer
                           ? AppColors.error
                           : AppColors.textTertiary,
                   fontSize: 14,
@@ -704,9 +794,7 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Text(
-            isTie
-                ? 'It\'s a tie'
-                : (iWon ? 'You won' : 'You lost'),
+            isTie ? 'It\'s a tie' : (iWon ? 'You won' : 'You lost'),
             style: const TextStyle(
               color: AppColors.textPrimary,
               fontSize: 28,
@@ -724,20 +812,13 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
           const SizedBox(height: 8),
           Text(
             'You  vs  ${state.opponentName}',
-            style: const TextStyle(
-                color: AppColors.textTertiary, fontSize: 14),
+            style: const TextStyle(color: AppColors.textTertiary, fontSize: 14),
           ),
           const SizedBox(height: 48),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              OutlinedButton(
-                onPressed: () {
-                  ref.read(triviaGameProvider.notifier).reset();
-                  context.go('/matches');
-                },
-                child: const Text('Back'),
-              ),
+              OutlinedButton(onPressed: _quitGame, child: const Text('Back')),
               const SizedBox(width: 16),
               if (state.isHost)
                 ElevatedButton(
@@ -745,17 +826,20 @@ class _TriviaScreenState extends ConsumerState<TriviaScreen>
                     final newGameId = const Uuid().v4();
                     final opponentId = state.opponentId;
                     final opponentName = state.opponentName;
-                    ref.read(triviaGameProvider.notifier)
+                    ref
+                        .read(triviaGameProvider.notifier)
                         .startGame(opponentId, opponentName, newGameId);
-                    ref.read(appControllerProvider).sendGameMessage(
-                      opponentId,
-                      GameMessage(
-                        gameId: newGameId,
-                        gameType: GameType.trivia,
-                        type: GameMessageType.invite,
-                        payload: {},
-                      ),
-                    );
+                    ref
+                        .read(appControllerProvider)
+                        .sendGameMessage(
+                          opponentId,
+                          GameMessage(
+                            gameId: newGameId,
+                            gameType: GameType.trivia,
+                            type: GameMessageType.invite,
+                            payload: {},
+                          ),
+                        );
                   },
                   child: const Text('Play Again'),
                 ),
@@ -804,8 +888,7 @@ class _ScoreBar extends StatelessWidget {
                 ),
                 const Text(
                   'You',
-                  style:
-                      TextStyle(color: AppColors.textTertiary, fontSize: 12),
+                  style: TextStyle(color: AppColors.textTertiary, fontSize: 12),
                 ),
               ],
             ),
@@ -827,7 +910,10 @@ class _ScoreBar extends StatelessWidget {
                 ),
                 Text(
                   opponentName,
-                  style: const TextStyle(color: AppColors.textTertiary, fontSize: 12),
+                  style: const TextStyle(
+                    color: AppColors.textTertiary,
+                    fontSize: 12,
+                  ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),

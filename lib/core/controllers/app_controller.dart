@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:uuid/uuid.dart';
 
 import 'package:liita/core/models/mesh_packet.dart';
@@ -26,9 +27,11 @@ import 'package:liita/core/providers/alert_provider.dart';
 class _PendingSend {
   final MeshPacket packet;
   final String? messageId; // text only: flips the chat "delivered" flag on ACK
+  final String? gameId; // game only: lets a quit purge that game's pending sends
   int attempts;
   int nextRetryAtMs;
-  _PendingSend(this.packet, this.messageId, this.attempts, this.nextRetryAtMs);
+  _PendingSend(this.packet, this.messageId, this.gameId, this.attempts,
+      this.nextRetryAtMs);
 }
 
 /// Central packet routing engine for the Liita BLE mesh network.
@@ -73,6 +76,15 @@ class AppController {
 
   void Function(String peerId)? get onMatchCreated => _onMatchCreated;
 
+  /// Called when a peer's profile photo has finished reassembling. The UI
+  /// layer sets this to invalidate the cached profile so the avatar re-reads
+  /// from disk. (Set-once at startup; a photo can only arrive well after a
+  /// match, so no pending-queue is needed as there is for [onMatchCreated].)
+  void Function(String peerId)? _onPeerPhotoUpdated;
+
+  set onPeerPhotoUpdated(void Function(String peerId)? callback) =>
+      _onPeerPhotoUpdated = callback;
+
   /// In-memory peer name cache to avoid DB lookups on every notification.
   final Map<String, String> _peerNameCache = {};
 
@@ -94,6 +106,13 @@ class AppController {
   static const int _retryBaseMs = 3000; // grows linearly per attempt
   static const int _retryMaxAttempts = 5;
 
+  // Periodic maintenance: prunes the packet-dedup table (every incoming packet
+  // inserts a row and is checked against it on the hot path) and stale photo
+  // chunks. Without this the dedup table grows unbounded — a photo transfer
+  // alone adds ~100 rows — and packet processing slows the longer the app runs.
+  Timer? _maintenanceTimer;
+  static const Duration _maintenanceInterval = Duration(minutes: 2);
+
   static const _uuid = Uuid();
 
   AppController({
@@ -102,11 +121,11 @@ class AppController {
     required CryptoService crypto,
     required NotificationService notifications,
     required Ref ref,
-  })  : _db = db,
-        _mesh = mesh,
-        _crypto = crypto,
-        _notifications = notifications,
-        _ref = ref;
+  }) : _db = db,
+       _mesh = mesh,
+       _crypto = crypto,
+       _notifications = notifications,
+       _ref = ref;
 
   // ===========================================================================
   // LIFECYCLE
@@ -126,11 +145,17 @@ class AppController {
     _packetSub = _mesh.incomingPackets.listen(
       _enqueuePacket,
       onError: (Object e, StackTrace st) {
-        debugPrint('AppController: incomingPackets stream error (subscription preserved): $e\n$st');
+        debugPrint(
+          'AppController: incomingPackets stream error (subscription preserved): $e\n$st',
+        );
         // Do NOT cancel — the stream error handler keeps the subscription alive.
       },
-      cancelOnError: false,  // Critical: keep listening after errors
+      cancelOnError: false, // Critical: keep listening after errors
     );
+
+    _maintenanceTimer?.cancel();
+    _maintenanceTimer =
+        Timer.periodic(_maintenanceInterval, (_) => runMaintenance());
   }
 
   /// Tears down all subscriptions. Safe to call multiple times.
@@ -139,12 +164,48 @@ class AppController {
     _packetSub = null;
     _peerSub?.cancel();
     _peerSub = null;
+    _maintenanceTimer?.cancel();
+    _maintenanceTimer = null;
     _peerNameCache.clear();
     _incomingQueue.clear();
     _isProcessingQueue = false;
     _retryTimer?.cancel();
     _retryTimer = null;
     _pendingSends.clear();
+  }
+
+  /// Fully resets local state for "End Flight Session": stops the mesh,
+  /// wipes all local social/mesh data (matches, chat, lounge, dedup cache,
+  /// cached peer profiles), and retires the current cryptographic identity
+  /// (device ID + keypair) so the next onboard produces a genuinely new
+  /// mesh identity — as if freshly installed. The human-entered profile
+  /// fields (name, age, seat, occupation, icebreaker, photo) are preserved
+  /// so onboarding can pre-fill them; only the identity fields are rotated.
+  ///
+  /// This class cannot import providers.dart (would create a circular
+  /// import with game_provider.dart's existing constraint — see CLAUDE.md),
+  /// so Riverpod-level UI state (wavedAtProvider, peersProvider, etc.) is
+  /// NOT touched here. The caller is responsible for resetting/invalidating
+  /// those after this returns.
+  Future<void> endFlightSession() async {
+    await _mesh.stopMesh();
+    await _db.clearAllData();
+    await _crypto.resetIdentity();
+
+    final storage = StorageService.instance;
+    final oldProfile = await storage.loadProfile();
+    if (oldProfile != null) {
+      await storage.saveProfile(
+        oldProfile.copyWith(deviceId: _uuid.v4(), publicKey: ''),
+      );
+    }
+    await storage.setOnboardingComplete(false);
+
+    // Rewind to pre-initialize() state so a later re-onboard can call
+    // initialize() again cleanly with the new device ID — the guard in
+    // initialize() would otherwise make that call a no-op.
+    dispose();
+    _initialized = false;
   }
 
   // ===========================================================================
@@ -215,7 +276,9 @@ class AppController {
           await _handleGame(packet);
       }
     } catch (e, st) {
-      debugPrint('AppController: error processing packet ${packet.packetId}: $e');
+      debugPrint(
+        'AppController: error processing packet ${packet.packetId}: $e',
+      );
       debugPrint('$st');
     }
   }
@@ -231,13 +294,15 @@ class AppController {
     if (await _db.isBlocked(_localDeviceId, packet.originId)) return;
 
     // Record the incoming wave
-    await _db.insertMatchEvent(MatchEvent(
-      eventId: _uuid.v4(),
-      eventType: MatchEventType.waveReceived,
-      actorId: packet.originId,
-      targetId: _localDeviceId,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _db.insertMatchEvent(
+      MatchEvent(
+        eventId: _uuid.v4(),
+        eventType: MatchEventType.waveReceived,
+        actorId: packet.originId,
+        targetId: _localDeviceId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
 
     // Store their public key from the wave data field (needed for key exchange)
     if (packet.data.isNotEmpty) {
@@ -271,13 +336,15 @@ class AppController {
     if (await _db.isBlocked(_localDeviceId, packet.originId)) return;
 
     // RC-14 FIX: Record as waveReceived — they waved (accepted) us.
-    await _db.insertMatchEvent(MatchEvent(
-      eventId: _uuid.v4(),
-      eventType: MatchEventType.waveReceived,
-      actorId: packet.originId,
-      targetId: _localDeviceId,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _db.insertMatchEvent(
+      MatchEvent(
+        eventId: _uuid.v4(),
+        eventType: MatchEventType.waveReceived,
+        actorId: packet.originId,
+        targetId: _localDeviceId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
 
     // Extract and store their public key from the data field if present
     if (packet.data.isNotEmpty) {
@@ -331,9 +398,8 @@ class AppController {
 
     // Fire notification
     final senderName = await _getPeerName(packet.originId);
-    final preview = plaintext.length > 40
-        ? '${plaintext.substring(0, 40)}...'
-        : plaintext;
+    final preview =
+        plaintext.length > 40 ? '${plaintext.substring(0, 40)}...' : plaintext;
     await _notifications.showMessageNotification(senderName, preview);
   }
 
@@ -357,18 +423,30 @@ class AppController {
   // HANDLER: PHOTO CHUNK
   // ===========================================================================
 
-  /// Stores an incoming photo chunk. When all chunks for a photo are received,
-  /// the UI layer can reassemble them.
+  /// Stores an incoming photo chunk and, once every chunk from this sender has
+  /// arrived, reassembles them into a local avatar file (see
+  /// [DatabaseService.assemblePhotoIfComplete]). Chunks are grouped by the
+  /// sender's deviceId ([MeshPacket.originId]) — it's already in the envelope,
+  /// so the chunk payload only carries the index (`i`), total (`n`), and the
+  /// base64 fragment (`d`).
   Future<void> _handlePhotoChunk(MeshPacket packet) async {
     try {
       final json = jsonDecode(packet.data) as Map<String, dynamic>;
+      final total = json['n'] as int;
       await _db.insertChunk({
-        'photo_hash': json['photoHash'] as String,
-        'chunk_index': json['chunkIndex'] as int,
-        'total_chunks': json['totalChunks'] as int,
-        'data': json['data'] as String,
+        'photo_hash': packet.originId,
+        'chunk_index': json['i'] as int,
+        'total_chunks': total,
+        'data': json['d'] as String,
         'received_at': DateTime.now().millisecondsSinceEpoch,
       });
+
+      final path = await _db.assemblePhotoIfComplete(packet.originId, total);
+      if (path != null) {
+        // Let the UI re-read the peer's profile — its avatar now points at
+        // the reassembled local file.
+        _onPeerPhotoUpdated?.call(packet.originId);
+      }
     } catch (e) {
       debugPrint('AppController: photoChunk parse failed: $e');
     }
@@ -387,14 +465,16 @@ class AppController {
     } catch (e) {
       // Fallback: treat data as raw text with basic metadata
       final senderName = await _getPeerName(packet.originId);
-      await _db.insertBroadcast(BroadcastMessage(
-        messageId: const Uuid().v4(),
-        fromId: packet.originId,
-        senderName: senderName,
-        seatNumber: '',
-        text: packet.data,
-        timestamp: packet.timestamp,
-      ));
+      await _db.insertBroadcast(
+        BroadcastMessage(
+          messageId: const Uuid().v4(),
+          fromId: packet.originId,
+          senderName: senderName,
+          seatNumber: '',
+          text: packet.data,
+          timestamp: packet.timestamp,
+        ),
+      );
     }
   }
 
@@ -430,7 +510,8 @@ class AppController {
           await _handleTicTacToe(gm, packet.originId);
         case GameType.trivia:
           await _handleTrivia(gm, packet.originId);
-          break;
+        case GameType.connectFour:
+          await _handleConnectFour(gm, packet.originId);
       }
     } catch (e) {
       debugPrint('[AppController] _handleGame error: $e');
@@ -440,17 +521,24 @@ class AppController {
   /// Handles all Tic-Tac-Toe game messages.
   Future<void> _handleTicTacToe(GameMessage gm, String originId) async {
     final notifier = _ref.read(ticTacToeProvider.notifier);
+    final tttState = _ref.read(ticTacToeProvider);
 
     switch (gm.type) {
       case GameMessageType.invite:
-        // Auto-decline (busy) only if a game is genuinely in progress — a
-        // finished game (winner set) or one whose opponent disconnected must
-        // not block a new invite (including a "Play Again" from the same
-        // peer), or rematches/new challenges get silently declined forever.
-        final tttState = _ref.read(ticTacToeProvider);
-        if (tttState != null &&
+        // Decline as "busy" ONLY if genuinely in an in-progress game with a
+        // DIFFERENT peer. A re-invite from the peer we're already playing is a
+        // rematch/restart — never decline it (that was the dominant "game not
+        // found" cause: a peer who backgrounded the app kept a stale in-progress
+        // game, auto-declined the re-challenge, and the challenger's decline
+        // handler then nulled their fresh game). The stale state is harmlessly
+        // replaced when the invite is accepted (onInviteAccepted builds fresh
+        // state for the new gameId), so no reset — and thus no "game not found"
+        // flash — is needed here.
+        final tttBusyWithOther = tttState != null &&
+            tttState.opponentId != originId &&
             tttState.winner == null &&
-            !tttState.opponentDisconnected) {
+            !tttState.opponentDisconnected;
+        if (tttBusyWithOther) {
           await sendGameMessage(
             originId,
             GameMessage(
@@ -477,13 +565,28 @@ class AppController {
         );
         break;
       case GameMessageType.decline:
-        notifier.reset();
+        // Only tear down if this decline is for the game we're currently
+        // waiting on — a stale decline from an abandoned game must not null
+        // out a freshly-started one (which would show "game not found").
+        if (tttState != null && tttState.gameId == gm.gameId) {
+          notifier.reset();
+        }
         break;
       case GameMessageType.move:
-        notifier.onMoveReceived(gm.payload['index'] as int);
+        // Guard against a retried/late packet from an abandoned game landing
+        // on a game the player has since moved on from.
+        if (tttState != null && tttState.gameId == gm.gameId) {
+          notifier.onMoveReceived(gm.payload['index'] as int);
+        }
         break;
       case GameMessageType.end:
-        notifier.reset();
+        // The peer explicitly left — show the existing "opponent
+        // disconnected" banner (with its Exit button) rather than nulling
+        // state out from under an active screen, which read as "Game not
+        // found or ended" with no way to tell what happened.
+        if (tttState != null && tttState.gameId == gm.gameId) {
+          notifier.markDisconnected();
+        }
         break;
       case GameMessageType.question:
       case GameMessageType.answer:
@@ -492,16 +595,86 @@ class AppController {
     }
   }
 
-  /// Handles all Cabin Trivia game messages.
-  Future<void> _handleTrivia(GameMessage gm, String originId) async {
-    final notifier = _ref.read(triviaGameProvider.notifier);
+  /// Handles all Connect Four game messages. Structurally identical to
+  /// [_handleTicTacToe] (same reliable turn-based model + rematch/leave fixes);
+  /// the only difference is the move payload carries a `column` instead of a
+  /// cell `index`.
+  Future<void> _handleConnectFour(GameMessage gm, String originId) async {
+    final notifier = _ref.read(connectFourProvider.notifier);
+    final c4State = _ref.read(connectFourProvider);
 
     switch (gm.type) {
       case GameMessageType.invite:
-        // Auto-decline (busy) only if a trivia game is genuinely in progress
-        // — a finished game must not block a new invite/rematch.
-        final triviaState = _ref.read(triviaGameProvider);
-        if (triviaState != null && triviaState.phase != TriviaPhase.finished) {
+        // Decline only if in an in-progress game with a DIFFERENT peer; a
+        // re-invite from the current opponent is a rematch (see the TTT
+        // handler for the full rationale).
+        final c4BusyWithOther = c4State != null &&
+            c4State.opponentId != originId &&
+            c4State.winner == null &&
+            !c4State.opponentDisconnected;
+        if (c4BusyWithOther) {
+          await sendGameMessage(
+            originId,
+            GameMessage(
+              gameId: gm.gameId,
+              gameType: GameType.connectFour,
+              type: GameMessageType.decline,
+              payload: {'reason': 'busy'},
+            ),
+          );
+          break;
+        }
+        _ref.read(pendingGameInviteProvider.notifier).state = PendingGameInvite(
+          gameId: gm.gameId,
+          gameType: GameType.connectFour,
+          peerId: originId,
+          peerName: await _getPeerName(originId),
+        );
+        break;
+      case GameMessageType.accept:
+        notifier.onInviteAccepted(
+          gm.gameId,
+          originId,
+          await _getPeerName(originId),
+        );
+        break;
+      case GameMessageType.decline:
+        if (c4State != null && c4State.gameId == gm.gameId) {
+          notifier.reset();
+        }
+        break;
+      case GameMessageType.move:
+        if (c4State != null && c4State.gameId == gm.gameId) {
+          notifier.onMoveReceived(gm.payload['column'] as int);
+        }
+        break;
+      case GameMessageType.end:
+        if (c4State != null && c4State.gameId == gm.gameId) {
+          notifier.markDisconnected();
+        }
+        break;
+      case GameMessageType.question:
+      case GameMessageType.answer:
+      case GameMessageType.result:
+        break; // Not used by Connect Four.
+    }
+  }
+
+  /// Handles all Cabin Trivia game messages.
+  Future<void> _handleTrivia(GameMessage gm, String originId) async {
+    final notifier = _ref.read(triviaGameProvider.notifier);
+    final triviaState = _ref.read(triviaGameProvider);
+
+    switch (gm.type) {
+      case GameMessageType.invite:
+        // Decline as "busy" ONLY if in an in-progress game with a DIFFERENT
+        // peer. A re-invite from the peer we're already playing is a rematch —
+        // never decline it (see the matching TTT handler for the full
+        // rationale); the stale state is replaced on accept.
+        final triviaBusyWithOther = triviaState != null &&
+            triviaState.opponentId != originId &&
+            triviaState.phase != TriviaPhase.finished;
+        if (triviaBusyWithOther) {
           await sendGameMessage(
             originId,
             GameMessage(
@@ -535,29 +708,33 @@ class AppController {
               gameId: gm.gameId,
               gameType: GameType.trivia,
               type: GameMessageType.question,
-              payload: {
-                'question': sanitized,
-                'index': 0,
-              },
+              payload: {'question': sanitized, 'index': 0},
             ),
           );
         }
         break;
 
       case GameMessageType.decline:
-        notifier.reset();
+        // Only tear down if this decline matches the game we're waiting on.
+        if (triviaState != null && triviaState.gameId == gm.gameId) {
+          notifier.reset();
+        }
         break;
 
       case GameMessageType.question:
-        // OPPONENT receives this.
+        // OPPONENT receives this. Guard against a retried/late packet from
+        // an abandoned game landing on a game already moved on from.
+        if (triviaState == null || triviaState.gameId != gm.gameId) break;
         final question = Map<String, dynamic>.from(
-            gm.payload['question'] as Map<String, dynamic>);
+          gm.payload['question'] as Map<String, dynamic>,
+        );
         final index = gm.payload['index'] as int;
         notifier.onQuestionReceived(question, index);
         break;
 
       case GameMessageType.answer:
         // HOST receives opponent's answer. Try to score.
+        if (triviaState == null || triviaState.gameId != gm.gameId) break;
         final selectedIndex = gm.payload['selectedIndex'] as int;
         final resultPayload = notifier.onAnswerReceived(selectedIndex);
         if (resultPayload != null) {
@@ -575,6 +752,7 @@ class AppController {
 
       case GameMessageType.result:
         // OPPONENT receives scored result from host.
+        if (triviaState == null || triviaState.gameId != gm.gameId) break;
         notifier.onResultReceived(
           correctIndex: gm.payload['correctIndex'] as int,
           hostScore: gm.payload['hostScore'] as int,
@@ -585,10 +763,15 @@ class AppController {
         break;
 
       case GameMessageType.end:
-        notifier.onGameEnded(
-          hostScore: gm.payload['hostScore'] as int,
-          opponentScore: gm.payload['opponentScore'] as int,
-        );
+        // Either party can send this (natural finish, or a manual quit) —
+        // always transitions the receiver to the finished screen instead of
+        // leaving them stranded on a stale wait state.
+        if (triviaState != null && triviaState.gameId == gm.gameId) {
+          notifier.onGameEnded(
+            hostScore: gm.payload['hostScore'] as int,
+            opponentScore: gm.payload['opponentScore'] as int,
+          );
+        }
         break;
 
       case GameMessageType.move:
@@ -601,26 +784,49 @@ class AppController {
   // ===========================================================================
 
   /// Payload types that are delivered reliably (sender retransmits until ACKed,
-  /// receiver ACKs every receipt). Broadcast/profileSync/photoChunk/game and the
-  /// ack itself are excluded.
+  /// receiver ACKs every receipt). Broadcast/profileSync and the ack itself are
+  /// excluded. Game packets are included — a single dropped
+  /// move/question/answer/result silently desyncs the two players with no
+  /// application-level recovery. Photo chunks are included too — a photo is
+  /// reassembled only when EVERY chunk arrives, so one silent drop would leave
+  /// the peer's avatar permanently blank.
   static bool _isReliable(PayloadType t) =>
       t == PayloadType.wave ||
       t == PayloadType.waveAccept ||
-      t == PayloadType.text;
+      t == PayloadType.text ||
+      t == PayloadType.game ||
+      t == PayloadType.photoChunk;
 
   /// Sends [packet] and keeps retransmitting it (same packetId — the receiver
   /// dedups, so it is processed once but ACKed every time) until the
   /// destination acknowledges it or the attempt budget is exhausted.
-  Future<void> _sendReliable(MeshPacket packet, {String? messageId}) async {
+  Future<void> _sendReliable(MeshPacket packet,
+      {String? messageId, String? gameId}) async {
     _pendingSends[packet.packetId] = _PendingSend(
       packet,
       messageId,
+      gameId,
       1,
       DateTime.now().millisecondsSinceEpoch + _retryBaseMs,
     );
-    _retryTimer ??=
-        Timer.periodic(const Duration(seconds: 1), (_) => _runRetries());
+    _retryTimer ??= Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _runRetries(),
+    );
     await _mesh.sendPacket(packet);
+  }
+
+  /// Drops any still-pending reliable sends belonging to [gameId]. Called when
+  /// a game is quit/ended so its in-flight moves/answers stop retransmitting —
+  /// the game is over, the peer is told via the `end` packet, and continuing to
+  /// resend old game packets is wasted work (and load) that made repeated play
+  /// progressively slower.
+  void cancelPendingGameSends(String gameId) {
+    _pendingSends.removeWhere((_, p) => p.gameId == gameId);
+    if (_pendingSends.isEmpty) {
+      _retryTimer?.cancel();
+      _retryTimer = null;
+    }
   }
 
   Future<void> _runRetries() async {
@@ -639,7 +845,8 @@ class AppController {
         if (p.attempts >= _retryMaxAttempts) {
           _pendingSends.remove(id);
           debugPrint(
-              'AppController: reliable ${p.packet.payloadType.name} ${id.substring(0, 8)} unacked after ${p.attempts} attempts — giving up');
+            'AppController: reliable ${p.packet.payloadType.name} ${id.substring(0, 8)} unacked after ${p.attempts} attempts — giving up',
+          );
           continue;
         }
         p.attempts++;
@@ -655,14 +862,16 @@ class AppController {
   /// ACKs are not themselves ARQ'd — a lost ACK is recovered by the sender's
   /// next retransmit, which is ACKed again).
   Future<void> _sendAck(String packetId, String toId) async {
-    await _mesh.sendPacket(MeshPacket(
-      packetId: _uuid.v4(),
-      originId: _localDeviceId,
-      destinationId: toId,
-      payloadType: PayloadType.ack,
-      data: packetId,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _mesh.sendPacket(
+      MeshPacket(
+        packetId: _uuid.v4(),
+        originId: _localDeviceId,
+        destinationId: toId,
+        payloadType: PayloadType.ack,
+        data: packetId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
   }
 
   // ===========================================================================
@@ -670,14 +879,17 @@ class AppController {
   // ===========================================================================
 
   Future<void> sendGameMessage(String peerId, GameMessage gm) async {
-    await _mesh.sendPacket(MeshPacket(
-      packetId: const Uuid().v4(),
-      originId: _localDeviceId,
-      destinationId: peerId,
-      payloadType: PayloadType.game,
-      data: jsonEncode(gm.toJson()),
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _sendReliable(
+      MeshPacket(
+        packetId: const Uuid().v4(),
+        originId: _localDeviceId,
+        destinationId: peerId,
+        payloadType: PayloadType.game,
+        data: jsonEncode(gm.toJson()),
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+      gameId: gm.gameId,
+    );
   }
 
   /// Sends a wave to [targetId]. Records a WAVE_SENT event and transmits
@@ -688,19 +900,23 @@ class AppController {
   Future<void> sendWave(String targetId) async {
     // RC-10: Log the suppressed re-wave so stale DB state is diagnosable.
     if (await _db.hasWaveSent(_localDeviceId, targetId)) {
-      debugPrint('AppController.sendWave: suppressed duplicate wave to $targetId (already in DB)');
+      debugPrint(
+        'AppController.sendWave: suppressed duplicate wave to $targetId (already in DB)',
+      );
       return;
     }
 
     if (await _db.isBlocked(_localDeviceId, targetId)) return;
 
-    await _db.insertMatchEvent(MatchEvent(
-      eventId: _uuid.v4(),
-      eventType: MatchEventType.waveSent,
-      actorId: _localDeviceId,
-      targetId: targetId,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _db.insertMatchEvent(
+      MatchEvent(
+        eventId: _uuid.v4(),
+        eventType: MatchEventType.waveSent,
+        actorId: _localDeviceId,
+        targetId: targetId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
 
     // RC-11: If key export fails, abort the wave rather than sending an empty key.
     // An empty key permanently breaks E2E encryption for this match.
@@ -709,28 +925,38 @@ class AppController {
       final pubKey = await _crypto.getPublicKey();
       publicKeyBase64 = await _crypto.exportPublicKey(pubKey);
     } catch (e, st) {
-      debugPrint('AppController.sendWave: key export failed — wave aborted: $e\n$st');
+      debugPrint(
+        'AppController.sendWave: key export failed — wave aborted: $e\n$st',
+      );
       // Roll back the WAVE_SENT event we just inserted since the wave wasn't sent.
-      await _db.deleteMatchEvent(eventType: MatchEventType.waveSent, actorId: _localDeviceId, targetId: targetId);
+      await _db.deleteMatchEvent(
+        eventType: MatchEventType.waveSent,
+        actorId: _localDeviceId,
+        targetId: targetId,
+      );
       return;
     }
 
     // Send wave packet (reliable — retransmitted until the peer ACKs).
-    await _sendReliable(MeshPacket(
-      packetId: _uuid.v4(),
-      originId: _localDeviceId,
-      destinationId: targetId,
-      payloadType: PayloadType.wave,
-      data: publicKeyBase64,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _sendReliable(
+      MeshPacket(
+        packetId: _uuid.v4(),
+        originId: _localDeviceId,
+        destinationId: targetId,
+        payloadType: PayloadType.wave,
+        data: publicKeyBase64,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
 
     // Race-condition fix: if they already waved at us before this wave was
     // recorded, send a waveAccept immediately so their device can create the
     // match without waiting for another round-trip.
     final theyAlreadyWaved = await _db.hasWaveFrom(targetId, _localDeviceId);
     if (theyAlreadyWaved) {
-      debugPrint('AppController.sendWave: mutual wave detected, sending waveAccept to $targetId');
+      debugPrint(
+        'AppController.sendWave: mutual wave detected, sending waveAccept to $targetId',
+      );
       await _sendWaveAccept(targetId, publicKeyBase64);
       await _createMatch(targetId);
     }
@@ -739,14 +965,16 @@ class AppController {
   /// Sends a waveAccept packet to [targetId], carrying our public key.
   /// Called when a mutual wave is detected at send-time (race-condition fix).
   Future<void> _sendWaveAccept(String targetId, String publicKeyBase64) async {
-    await _sendReliable(MeshPacket(
-      packetId: _uuid.v4(),
-      originId: _localDeviceId,
-      destinationId: targetId,
-      payloadType: PayloadType.waveAccept,
-      data: publicKeyBase64,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _sendReliable(
+      MeshPacket(
+        packetId: _uuid.v4(),
+        originId: _localDeviceId,
+        destinationId: targetId,
+        payloadType: PayloadType.waveAccept,
+        data: publicKeyBase64,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
   }
 
   /// Sends an encrypted text message to a matched peer.
@@ -817,36 +1045,42 @@ class AppController {
     await _db.insertBroadcast(message);
 
     // Send over mesh
-    await _mesh.sendPacket(MeshPacket(
-      packetId: const Uuid().v4(),
-      originId: _localDeviceId,
-      destinationId: '*',
-      payloadType: PayloadType.broadcast,
-      data: jsonEncode(message.toJson()),
-      timestamp: message.timestamp,
-    ));
+    await _mesh.sendPacket(
+      MeshPacket(
+        packetId: const Uuid().v4(),
+        originId: _localDeviceId,
+        destinationId: '*',
+        payloadType: PayloadType.broadcast,
+        data: jsonEncode(message.toJson()),
+        timestamp: message.timestamp,
+      ),
+    );
   }
 
   /// Blocks a peer. Inserts a BLOCKED event and prevents further interaction.
   Future<void> blockPeer(String peerId) async {
-    await _db.insertMatchEvent(MatchEvent(
-      eventId: const Uuid().v4(),
-      eventType: MatchEventType.blocked,
-      actorId: _localDeviceId,
-      targetId: peerId,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _db.insertMatchEvent(
+      MatchEvent(
+        eventId: const Uuid().v4(),
+        eventType: MatchEventType.blocked,
+        actorId: _localDeviceId,
+        targetId: peerId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
   }
 
   /// Reports a peer. Inserts a REPORTED event (also blocks).
   Future<void> reportPeer(String peerId) async {
-    await _db.insertMatchEvent(MatchEvent(
-      eventId: const Uuid().v4(),
-      eventType: MatchEventType.reported,
-      actorId: _localDeviceId,
-      targetId: peerId,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _db.insertMatchEvent(
+      MatchEvent(
+        eventId: const Uuid().v4(),
+        eventType: MatchEventType.reported,
+        actorId: _localDeviceId,
+        targetId: peerId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
     // Block on report
     await blockPeer(peerId);
   }
@@ -866,13 +1100,15 @@ class AppController {
     if (existingMatch) return;
 
     // Record MATCH_CREATED for both sides
-    await _db.insertMatchEvent(MatchEvent(
-      eventId: const Uuid().v4(),
-      eventType: MatchEventType.matchCreated,
-      actorId: _localDeviceId,
-      targetId: peerId,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    ));
+    await _db.insertMatchEvent(
+      MatchEvent(
+        eventId: const Uuid().v4(),
+        eventType: MatchEventType.matchCreated,
+        actorId: _localDeviceId,
+        targetId: peerId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
 
     // Attempt key derivation if we have the remote public key
     await _deriveAndStoreSharedKey(peerId, matchId);
@@ -891,7 +1127,9 @@ class AppController {
     );
 
     if (_onMatchCreated == null) {
-      debugPrint('[AppController] WARNING: onMatchCreated is null at match creation time. Queueing peerId: $peerId');
+      debugPrint(
+        '[AppController] WARNING: onMatchCreated is null at match creation time. Queueing peerId: $peerId',
+      );
       _pendingMatches.add(peerId);
     } else {
       _onMatchCreated?.call(peerId);
@@ -920,7 +1158,10 @@ class AppController {
   /// storage failed to return a persisted key) — derivation is deterministic,
   /// so it reconstructs the identical key from the DB-persisted peer pubkey and
   /// our private key.
-  Future<Uint8List?> _getOrDeriveSharedKey(String peerId, String matchId) async {
+  Future<Uint8List?> _getOrDeriveSharedKey(
+    String peerId,
+    String matchId,
+  ) async {
     var key = await _crypto.getSharedKey(matchId);
     if (key == null) {
       await _deriveAndStoreSharedKey(peerId, matchId);
@@ -930,10 +1171,7 @@ class AppController {
   }
 
   /// Derives and stores the ECDH shared secret for encrypted messaging.
-  Future<void> _deriveAndStoreSharedKey(
-    String peerId,
-    String matchId,
-  ) async {
+  Future<void> _deriveAndStoreSharedKey(String peerId, String matchId) async {
     try {
       // Check if we already have a shared key
       final existingKey = await _crypto.getSharedKey(matchId);
@@ -946,8 +1184,10 @@ class AppController {
       // Import their public key and derive the shared secret
       final theirPubKey = await _crypto.importPublicKey(peerProfile.publicKey);
       final myPrivKey = await _crypto.getOrCreatePrivateKey();
-      final sharedSecret =
-          await _crypto.deriveSharedSecret(myPrivKey, theirPubKey);
+      final sharedSecret = await _crypto.deriveSharedSecret(
+        myPrivKey,
+        theirPubKey,
+      );
 
       // Store for future message encryption/decryption
       await _crypto.storeSharedKey(matchId, sharedSecret);
@@ -961,7 +1201,9 @@ class AppController {
     _peerNameCache[peer.deviceId] = peer.name;
     // Persist to DB for longer-term access — fire-and-forget with error handling
     _db.upsertProfile(peer).catchError((e) {
-      debugPrint('AppController: upsertProfile failed for ${peer.deviceId}: $e');
+      debugPrint(
+        'AppController: upsertProfile failed for ${peer.deviceId}: $e',
+      );
     });
   }
 
@@ -978,45 +1220,71 @@ class AppController {
     return 'Someone';
   }
 
-  /// Slices the local profile photo into small chunks and transmits them to [targetId].
+  /// Slices the local profile photo into chunks and transmits them reliably to
+  /// [targetId]. The chunk payload is deliberately minimal — `i` (index), `n`
+  /// (total), `d` (base64 fragment) — because each mesh packet is a single
+  /// GATT write bounded by the negotiated MTU, and the packet envelope (three
+  /// UUIDs + gzip/base64 framing) already eats most of the budget. The sender's
+  /// deviceId (the reassembly key) rides in the packet envelope, so it isn't
+  /// repeated here.
   Future<void> _sendPhotoChunks(String targetId) async {
     try {
       final profile = await StorageService.instance.loadProfile();
       if (profile == null || profile.photoHash == null) return;
-      
+
       final file = File(profile.photoHash!);
       if (!file.existsSync()) return;
 
-      final bytes = await file.readAsBytes();
+      // Downscale to avatar size for transmission. The stored onboarding photo
+      // is 256px — overkill for a ~56px avatar, and every extra KB is another
+      // BLE chunk (each a full GATT connect cycle). A 128px/q55 re-compress is
+      // ~3-4x smaller, cutting the chunk count (and transfer time) accordingly,
+      // with no visible difference at avatar sizes. Falls back to the original
+      // bytes if compression fails.
+      Uint8List bytes;
+      try {
+        final small = await FlutterImageCompress.compressWithFile(
+          file.absolute.path,
+          minWidth: 128,
+          minHeight: 128,
+          quality: 55,
+        );
+        bytes = small ?? await file.readAsBytes();
+      } catch (_) {
+        bytes = await file.readAsBytes();
+      }
       final base64Photo = base64Encode(bytes);
-      
-      final chunkSize = 200;
+
+      // Sized to keep each packet (envelope + gzip/base64 framing) within a
+      // 512-MTU write with margin, even in the worst case where gzip can't
+      // compress the high-entropy base64 image data. See TARGET_MTU in
+      // MeshForegroundService.kt.
+      const chunkSize = 140;
       final totalChunks = (base64Photo.length / chunkSize).ceil();
-      
+
       for (int i = 0; i < totalChunks; i++) {
         final start = i * chunkSize;
-        final end = (start + chunkSize < base64Photo.length) 
-            ? start + chunkSize 
+        final end = (start + chunkSize < base64Photo.length)
+            ? start + chunkSize
             : base64Photo.length;
         final chunkData = base64Photo.substring(start, end);
-        
-        final payload = {
-          'photoHash': profile.photoHash,
-          'chunkIndex': i,
-          'totalChunks': totalChunks,
-          'data': chunkData,
-        };
 
-        await _mesh.sendPacket(MeshPacket(
-          packetId: const Uuid().v4(),
-          originId: _localDeviceId,
-          destinationId: targetId,
-          payloadType: PayloadType.photoChunk,
-          data: jsonEncode(payload),
-          timestamp: DateTime.now().millisecondsSinceEpoch,
-        ));
-        
-        await Future.delayed(const Duration(milliseconds: 50));
+        await _sendReliable(
+          MeshPacket(
+            packetId: const Uuid().v4(),
+            originId: _localDeviceId,
+            destinationId: targetId,
+            payloadType: PayloadType.photoChunk,
+            data: jsonEncode({'i': i, 'n': totalChunks, 'd': chunkData}),
+            timestamp: DateTime.now().millisecondsSinceEpoch,
+          ),
+        );
+
+        // Pace the enqueue so a photo (potentially many chunks) doesn't
+        // monopolize the shared native send queue — a wave or chat message
+        // sent mid-transfer can interleave instead of waiting behind every
+        // chunk. The ARQ retry timer still guarantees eventual delivery.
+        await Future.delayed(const Duration(milliseconds: 40));
       }
     } catch (e) {
       debugPrint('AppController: failed to send photo chunks: $e');

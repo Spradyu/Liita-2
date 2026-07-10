@@ -37,6 +37,13 @@ const _games = [
     gameType: GameType.ticTacToe,
   ),
   _Game(
+    'Connect Four',
+    Icons.view_column_rounded,
+    available: true,
+    routePath: '/games/connectfour',
+    gameType: GameType.connectFour,
+  ),
+  _Game(
     'Cabin Trivia',
     Icons.help_outline_rounded,
     available: true,
@@ -44,7 +51,6 @@ const _games = [
     gameType: GameType.trivia,
   ),
   _Game('Word Chain', Icons.link_rounded),
-  _Game('Chess', Icons.sports_esports_outlined),
   _Game('Battleship', Icons.radar_rounded),
 ];
 
@@ -319,6 +325,9 @@ class _PeerRow extends ConsumerWidget {
                 break;
               case GameType.trivia:
                 ref.read(triviaGameProvider.notifier).startGame(peerId, profile.name, gameId);
+                break;
+              case GameType.connectFour:
+                ref.read(connectFourProvider.notifier).startGame(peerId, profile.name, gameId);
                 break;
             }
             context.push(game.routePath);

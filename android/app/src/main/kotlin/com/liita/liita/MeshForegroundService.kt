@@ -33,8 +33,16 @@ class MeshForegroundService : Service() {
         val SERVICE_UUID: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
         val PROFILE_CHAR_UUID: UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
         const val TAG = "MeshForegroundService"
-        // RC-1: Minimum MTU we negotiate. 247 gives 244-byte writes (max for BLE 4.2/5.0).
-        const val TARGET_MTU = 247
+        // RC-1: MTU we request per send connection. 512 gives ~509-byte writes on
+        // BLE 5.0 devices, needed so a profile photo transfers in a reasonable
+        // number of chunks (each mesh packet is one GATT write). requestMtu()
+        // negotiates DOWN automatically on devices/links that can't do 512, so
+        // this is safe — small control packets (waves/messages/games) fit any
+        // MTU and are unaffected; only large photo-chunk packets benefit. A link
+        // that negotiates a low MTU simply can't carry a full-size photo chunk,
+        // in which case that peer's avatar falls back to initials (the transfer's
+        // ARQ retries give up) while everything else keeps working.
+        const val TARGET_MTU = 512
         // Safety timeout for each send task — prevents isSending deadlock if connectGatt hangs.
         const val SEND_TIMEOUT_MS = 8000L
         // Residual 2C fix: re-read a peer's profile at most this often, so we can close
@@ -126,6 +134,21 @@ class MeshForegroundService : Service() {
         stopMesh()
         scope.cancel()
         super.onDestroy()
+    }
+
+    /// Called when the user swipes the app away from Recents/the task
+    /// switcher — distinct from just backgrounding (pressing Home), which
+    /// does NOT fire this and correctly leaves the mesh running so others
+    /// can still discover/wave. A foreground service does not stop on its
+    /// own when its task is removed, so without this override the mesh
+    /// (advertising, scanning, GATT server, notification) would keep
+    /// running indefinitely with no way for the user to close it.
+    /// stopSelf() triggers the existing onDestroy() -> stopMesh() teardown,
+    /// unchanged from the manual-stop path.
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.d("LiitaBLE", "[LiitaBLE] onTaskRemoved — app swiped from recents, stopping mesh")
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     /// Starts the mesh engine. Returns true only if it actually started (or was

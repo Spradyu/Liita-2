@@ -58,6 +58,14 @@ class _HomeShellState extends ConsumerState<HomeShell>
           ref.read(newMatchProvider.notifier).state = peerId;
         };
 
+        // When a peer's photo finishes reassembling, drop the cached profile
+        // future so avatars (matches, chat, radar) re-read the new local file.
+        ref.read(appControllerProvider).onPeerPhotoUpdated = (peerId) {
+          if (!mounted) return;
+          ref.invalidate(matchProfileProvider(peerId));
+          ref.invalidate(wavedPeerProfilesProvider);
+        };
+
         // Restore persisted wave state from the DB so a peer you've waved at
         // keeps its radar card across app restarts, and incoming-wave badges
         // survive too. (Out-of-range removal for non-waved peers is handled by
@@ -199,6 +207,15 @@ class _HomeShellState extends ConsumerState<HomeShell>
                                     );
                                 ref.read(pendingGameInviteProvider.notifier).state = null;
                                 context.push('/games/trivia');
+                                break;
+                              case GameType.connectFour:
+                                ref.read(connectFourProvider.notifier).onInviteAccepted(
+                                      next.gameId,
+                                      next.peerId,
+                                      next.peerName,
+                                    );
+                                ref.read(pendingGameInviteProvider.notifier).state = null;
+                                context.push('/games/connectfour');
                                 break;
                             }
                           },

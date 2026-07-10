@@ -9,6 +9,7 @@ import 'package:liita/features/matches/matches_screen.dart';
 import 'package:liita/features/games/games_screen.dart';
 import 'package:liita/features/games/tictactoe_screen.dart';
 import 'package:liita/features/games/trivia_screen.dart';
+import 'package:liita/features/games/connect_four_screen.dart';
 import 'package:liita/features/lounge/lounge_screen.dart';
 import 'package:liita/features/profile/profile_screen.dart';
 import 'package:liita/features/chat/chat_screen.dart';
@@ -62,16 +63,6 @@ final routerProvider = Provider<GoRouter>((ref) {
             pageBuilder: (context, state) => const NoTransitionPage(
               child: GamesScreen(),
             ),
-            routes: [
-              GoRoute(
-                path: 'tictactoe',
-                builder: (context, state) => const TicTacToeScreen(),
-              ),
-              GoRoute(
-                path: 'trivia',
-                builder: (context, state) => const TriviaScreen(),
-              ),
-            ],
           ),
           GoRoute(
             path: '/lounge',
@@ -94,6 +85,24 @@ final routerProvider = Provider<GoRouter>((ref) {
           final peerName = state.uri.queryParameters['name'] ?? 'Chat';
           return ChatScreen(matchId: matchId, peerName: peerName);
         },
+      ),
+      // Game boards are FULL-SCREEN (outside the shell / no bottom nav) so the
+      // only way out is the in-game Quit (X) or the back gesture — both of
+      // which fire _quitGame and tell the opponent the game ended. Inside the
+      // shell, a nav-tab tap would silently leave the board without notifying
+      // the peer, so the opponent only saw the disconnect on the ~30s mesh
+      // presence timeout, not when the player actually left the screen.
+      GoRoute(
+        path: '/games/tictactoe',
+        builder: (context, state) => const TicTacToeScreen(),
+      ),
+      GoRoute(
+        path: '/games/trivia',
+        builder: (context, state) => const TriviaScreen(),
+      ),
+      GoRoute(
+        path: '/games/connectfour',
+        builder: (context, state) => const ConnectFourScreen(),
       ),
       // TEMP DEBUG: standalone neumorphic UI showcase (reached from Profile).
       GoRoute(

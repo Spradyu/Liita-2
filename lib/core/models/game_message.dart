@@ -2,7 +2,8 @@
 /// can dispatch each packet to the correct game notifier.
 enum GameType {
   ticTacToe('ttt', 'Tic Tac Toe'),
-  trivia('trivia', 'Cabin Trivia');
+  trivia('trivia', 'Cabin Trivia'),
+  connectFour('c4', 'Connect Four');
 
   /// Compact wire code sent inside the packet JSON.
   final String code;

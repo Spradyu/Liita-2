@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:sqflite/sqflite.dart';
 import 'package:path_provider/path_provider.dart';
@@ -139,6 +142,39 @@ class DatabaseService {
     return db;
   }
 
+  /// Wipes every table — cached profiles (own + peers'), matches/waves,
+  /// chat messages, photo chunks, packet dedup, and lounge broadcasts. Used
+  /// by "End Flight Session" for a full reset. The human-entered profile
+  /// fields (name, age, etc.) live in [StorageService], not here, and are
+  /// preserved separately by the caller.
+  Future<void> clearAllData() async {
+    final batch = _database.batch();
+    batch.delete('profiles');
+    batch.delete('match_events');
+    batch.delete('messages');
+    batch.delete('photo_chunks');
+    batch.delete('packet_dedup');
+    batch.delete('broadcast_messages');
+    await batch.commit(noResult: true);
+
+    // Close per-match message stream subscriptions — their matchIds no
+    // longer have any backing rows.
+    for (final controller in _messageControllers.values) {
+      if (!controller.isClosed) await controller.close();
+    }
+    _messageControllers.clear();
+
+    // Delete reassembled peer-avatar files (they live on disk, not in a
+    // table, so the deletes above don't touch them).
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final photoDir = Directory(p.join(dir.path, 'peer_photos'));
+      if (photoDir.existsSync()) photoDir.deleteSync(recursive: true);
+    } catch (_) {}
+
+    _notifyBroadcastListeners();
+  }
+
   // ===========================================================================
   // PROFILES
   // ===========================================================================
@@ -152,12 +188,34 @@ class DatabaseService {
   /// with the existing stored key rather than overwriting it.
   Future<void> upsertProfile(UserProfile profile) async {
     var effective = profile;
-    if (profile.publicKey.isEmpty) {
-      final existing = await getProfile(profile.deviceId);
-      if (existing != null && existing.publicKey.isNotEmpty) {
-        effective = profile.copyWith(publicKey: existing.publicKey);
-      }
+
+    // The publicKey and photo_hash both need existing-value preservation, so
+    // fetch the existing row once if either might need it.
+    final incomingPhotoIsLocalFile = profile.photoHash != null &&
+        profile.photoHash!.isNotEmpty &&
+        File(profile.photoHash!).existsSync();
+    final needExisting = profile.publicKey.isEmpty || !incomingPhotoIsLocalFile;
+    final existing = needExisting ? await getProfile(profile.deviceId) : null;
+
+    if (profile.publicKey.isEmpty &&
+        existing != null &&
+        existing.publicKey.isNotEmpty) {
+      effective = effective.copyWith(publicKey: existing.publicKey);
     }
+
+    // photo_hash is a LOCAL file path. For the local user's own profile it is
+    // a real file that exists here; for a peer discovered over the mesh it is
+    // *their* device's path, meaningless (and non-existent) on this device.
+    // A peer's real avatar only ever becomes valid locally via photo-chunk
+    // reassembly (assemblePhotoIfComplete, which writes a local file and sets
+    // photo_hash directly). So only accept an incoming photo_hash that points
+    // to a file that actually exists here; otherwise keep whatever is already
+    // stored (a previously reassembled avatar, or null) — never clobber it
+    // with a remote path we can't render.
+    final effectivePhotoHash = incomingPhotoIsLocalFile
+        ? profile.photoHash
+        : existing?.photoHash;
+
     await _database.insert(
       'profiles',
       {
@@ -166,7 +224,7 @@ class DatabaseService {
         'age': effective.age,
         'seat_number': effective.seatNumber,
         'occupation': effective.occupation,
-        'photo_hash': effective.photoHash,
+        'photo_hash': effectivePhotoHash,
         'version': effective.version,
         'public_key': effective.publicKey,
         'icebreaker_prompt': effective.icebreakerPrompt,
@@ -469,6 +527,69 @@ class DatabaseService {
       chunk,
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+  }
+
+  /// If all [totalChunks] for [photoKey] are present, reassembles them into a
+  /// local image file, points the peer's profile row at it, clears the chunk
+  /// rows, and returns the new file path. Returns null if still incomplete.
+  ///
+  /// [photoKey] is the sending peer's deviceId — chunks are grouped by sender
+  /// (the sender's deviceId is already in every packet's envelope, so it costs
+  /// nothing on the wire and avoids leaking the sender's local file path).
+  /// Chunk rows are keyed by (photo_hash = photoKey, chunk_index); duplicates
+  /// from ARQ retransmits collapse via REPLACE, so a distinct-index count of
+  /// [totalChunks] means complete.
+  Future<String?> assemblePhotoIfComplete(
+      String photoKey, int totalChunks) async {
+    final chunks = await getChunks(photoKey);
+    if (chunks.length < totalChunks) return null;
+
+    // Concatenate the base64 fragments in index order (getChunks orders by
+    // chunk_index ASC) and decode to the original image bytes.
+    final buffer = StringBuffer();
+    for (final row in chunks) {
+      buffer.write(row['data'] as String);
+    }
+    final Uint8List bytes;
+    try {
+      bytes = base64Decode(buffer.toString());
+    } catch (_) {
+      // Corrupt/incomplete data — drop the chunks so a resend can start clean.
+      await deleteChunks(photoKey);
+      return null;
+    }
+
+    final dir = await getApplicationDocumentsDirectory();
+    final photoDir = Directory(p.join(dir.path, 'peer_photos'));
+    if (!photoDir.existsSync()) photoDir.createSync(recursive: true);
+
+    // Timestamped filename so a re-received photo produces a NEW path — this
+    // sidesteps Flutter's file-image cache keying on path (an in-place
+    // overwrite could keep showing stale bytes). Delete any older file for
+    // this peer first so they don't accumulate.
+    for (final f in photoDir.listSync()) {
+      if (f is File && p.basename(f.path).startsWith('${photoKey}_')) {
+        try {
+          f.deleteSync();
+        } catch (_) {}
+      }
+    }
+    final path =
+        p.join(photoDir.path, '${photoKey}_${DateTime.now().millisecondsSinceEpoch}.jpg');
+    await File(path).writeAsBytes(bytes, flush: true);
+
+    // Point the peer's profile row at the local file (only if a row exists —
+    // it normally does, since a photo only arrives after a match, which
+    // requires having discovered/stored their profile first).
+    await _database.update(
+      'profiles',
+      {'photo_hash': path},
+      where: 'device_id = ?',
+      whereArgs: [photoKey],
+    );
+
+    await deleteChunks(photoKey);
+    return path;
   }
 
   Future<List<Map<String, dynamic>>> getChunks(String photoHash) async {

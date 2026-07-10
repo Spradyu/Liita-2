@@ -2,7 +2,8 @@ import 'package:flutter_neumorphic_plus/flutter_neumorphic.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:liita/core/theme/app_theme.dart';
 import 'package:liita/core/providers/providers.dart';
-import 'package:liita/core/services/storage_service.dart';
+import 'package:liita/core/providers/game_provider.dart';
+import 'package:liita/core/providers/alert_provider.dart';
 import 'package:liita/core/widgets/avatar_widget.dart';
 
 class ProfileScreen extends ConsumerWidget {
@@ -188,7 +189,9 @@ class ProfileScreen extends ConsumerWidget {
           style: TextStyle(color: AppColors.textPrimary, fontSize: 18, fontWeight: FontWeight.w500),
         ),
         content: const Text(
-          'This will end your current flight session. Your profile will be saved for your next flight.',
+          'This clears everyone you\'ve waved at, matched with, and every '
+          'message and lounge post from this flight — like a fresh install. '
+          'Only your name, age, seat, and photo are kept for next time.',
           style: TextStyle(color: AppColors.textSecondary, fontSize: 14, height: 1.5),
         ),
         actions: [
@@ -205,8 +208,23 @@ class ProfileScreen extends ConsumerWidget {
     );
 
     if (confirmed == true) {
-      await StorageService.instance.setOnboardingComplete(false);
+      await ref.read(appControllerProvider).endFlightSession();
+
+      // Riverpod-level UI state — AppController can't touch these directly
+      // (importing providers.dart here would create a circular import).
       ref.read(onboardingCompleteProvider.notifier).state = false;
+      ref.read(localProfileProvider.notifier).state = null;
+      ref.read(wavedAtProvider.notifier).state = {};
+      ref.read(wavedByProvider.notifier).state = {};
+      ref.read(newMatchProvider.notifier).state = null;
+      ref.read(pendingGameInviteProvider.notifier).state = null;
+      ref.read(ticTacToeProvider.notifier).reset();
+      ref.read(triviaGameProvider.notifier).reset();
+      ref.read(connectFourProvider.notifier).reset();
+      ref.read(incomingAlertProvider.notifier).state = null;
+      ref.invalidate(peersProvider);
+      ref.invalidate(activePeerCountProvider);
+      ref.invalidate(matchesProvider);
     }
   }
 }

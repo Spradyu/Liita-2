@@ -229,9 +229,9 @@ class _GameEntry {
 
 const _availableGames = [
   _GameEntry('Tic-Tac-Toe', Icons.grid_3x3_rounded, available: true, routePath: '/games/tictactoe', gameType: GameType.ticTacToe),
+  _GameEntry('Connect Four', Icons.view_column_rounded, available: true, routePath: '/games/connectfour', gameType: GameType.connectFour),
   _GameEntry('Cabin Trivia', Icons.help_outline_rounded, available: true, routePath: '/games/trivia', gameType: GameType.trivia),
   _GameEntry('Word Chain', Icons.link_rounded),
-  _GameEntry('Chess', Icons.sports_esports_outlined),
   _GameEntry('Battleship', Icons.radar_rounded),
 ];
 
@@ -321,6 +321,9 @@ class _GamePickerSheet extends StatelessWidget {
                           break;
                         case GameType.trivia:
                           ref.read(triviaGameProvider.notifier).startGame(peerId, peerName, gameId);
+                          break;
+                        case GameType.connectFour:
+                          ref.read(connectFourProvider.notifier).startGame(peerId, peerName, gameId);
                           break;
                       }
                       context.push(g.routePath);

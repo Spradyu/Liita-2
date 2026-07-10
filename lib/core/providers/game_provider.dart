@@ -169,6 +169,181 @@ class TicTacToeNotifier extends StateNotifier<TicTacToeState?> {
 }
 
 // ===========================================================================
+// CONNECT FOUR
+// ===========================================================================
+//
+// Turn-based, structurally identical to Tic-Tac-Toe (which is reliable on the
+// mesh): only the current player moves, sends the COLUMN it dropped into, and
+// the peer applies it. Because both boards apply the same moves in the same
+// order, the landing row is deterministic on both sides — so sending just the
+// column (not the resolved cell) stays in sync. Challenger is 'R' (red, moves
+// first); opponent is 'Y' (yellow).
+
+class ConnectFourState {
+  static const int cols = 7;
+  static const int rows = 6;
+
+  final String gameId;
+  final String opponentId;
+  final String opponentName;
+  final bool isChallenger;
+  final List<String> board; // rows*cols, row-major (index = row*cols + col)
+  final bool isMyTurn;
+  final String? winner; // 'R' | 'Y' | 'draw' | null
+  final int? lastMoveIndex; // most recent drop, for highlight
+  final bool opponentDisconnected;
+
+  const ConnectFourState({
+    required this.gameId,
+    required this.opponentId,
+    required this.opponentName,
+    required this.isChallenger,
+    required this.board,
+    required this.isMyTurn,
+    this.winner,
+    this.lastMoveIndex,
+    this.opponentDisconnected = false,
+  });
+
+  ConnectFourState copyWith({
+    List<String>? board,
+    bool? isMyTurn,
+    String? winner,
+    int? lastMoveIndex,
+    bool? opponentDisconnected,
+  }) {
+    return ConnectFourState(
+      gameId: gameId,
+      opponentId: opponentId,
+      opponentName: opponentName,
+      isChallenger: isChallenger,
+      board: board ?? this.board,
+      isMyTurn: isMyTurn ?? this.isMyTurn,
+      winner: winner ?? this.winner,
+      lastMoveIndex: lastMoveIndex ?? this.lastMoveIndex,
+      opponentDisconnected: opponentDisconnected ?? this.opponentDisconnected,
+    );
+  }
+
+  /// Row-major index where a token dropped in [col] would land (lowest empty
+  /// cell), or -1 if the column is full.
+  int landingIndex(int col) {
+    for (int r = rows - 1; r >= 0; r--) {
+      final idx = r * cols + col;
+      if (board[idx].isEmpty) return idx;
+    }
+    return -1;
+  }
+
+  String? checkWinner() {
+    // Scan every cell as a line start in 4 directions: →, ↓, ↘, ↙.
+    const dirs = [
+      [0, 1],
+      [1, 0],
+      [1, 1],
+      [1, -1],
+    ];
+    for (int r = 0; r < rows; r++) {
+      for (int c = 0; c < cols; c++) {
+        final cell = board[r * cols + c];
+        if (cell.isEmpty) continue;
+        for (final d in dirs) {
+          int count = 1;
+          int nr = r + d[0], nc = c + d[1];
+          while (nr >= 0 &&
+              nr < rows &&
+              nc >= 0 &&
+              nc < cols &&
+              board[nr * cols + nc] == cell) {
+            if (++count >= 4) return cell;
+            nr += d[0];
+            nc += d[1];
+          }
+        }
+      }
+    }
+    if (board.every((x) => x.isNotEmpty)) return 'draw';
+    return null;
+  }
+}
+
+final connectFourProvider =
+    StateNotifierProvider<ConnectFourNotifier, ConnectFourState?>(
+        (ref) => ConnectFourNotifier(ref));
+
+class ConnectFourNotifier extends StateNotifier<ConnectFourState?> {
+  ConnectFourNotifier(this._ref) : super(null);
+
+  // ignore: unused_field
+  final Ref _ref;
+
+  void startGame(String opponentId, String opponentName, String gameId) {
+    state = ConnectFourState(
+      gameId: gameId,
+      opponentId: opponentId,
+      opponentName: opponentName,
+      isChallenger: true,
+      board: List.filled(ConnectFourState.rows * ConnectFourState.cols, ''),
+      isMyTurn: false, // becomes true in onInviteAccepted (R goes first)
+    );
+  }
+
+  void markDisconnected() {
+    if (state != null && state!.winner == null) {
+      state = state!.copyWith(opponentDisconnected: true);
+    }
+  }
+
+  void onInviteAccepted(String gameId, String opponentId, String opponentName) {
+    if (state != null && state!.gameId == gameId) {
+      // I'm the challenger (R) — accepted, R moves first, so it's my turn.
+      state = state!.copyWith(isMyTurn: true);
+    } else {
+      // I'm the opponent (Y). R (challenger) goes first.
+      state = ConnectFourState(
+        gameId: gameId,
+        opponentId: opponentId,
+        opponentName: opponentName,
+        isChallenger: false,
+        board: List.filled(ConnectFourState.rows * ConnectFourState.cols, ''),
+        isMyTurn: false,
+      );
+    }
+  }
+
+  /// Drops my token in [col]. Returns the landing index if applied, or -1 if
+  /// it's not my turn / the game is over / the column is full.
+  int applyMove(int col) {
+    if (state == null || !state!.isMyTurn || state!.winner != null) return -1;
+    final idx = state!.landingIndex(col);
+    if (idx < 0) return -1;
+    final myMarker = state!.isChallenger ? 'R' : 'Y';
+    final board = List<String>.from(state!.board);
+    board[idx] = myMarker;
+    state = state!.copyWith(board: board, isMyTurn: false, lastMoveIndex: idx);
+    final w = state!.checkWinner();
+    if (w != null) state = state!.copyWith(winner: w);
+    return idx;
+  }
+
+  void onMoveReceived(int col) {
+    if (state == null) return;
+    final idx = state!.landingIndex(col);
+    if (idx < 0) return;
+    final opponentMarker = state!.isChallenger ? 'Y' : 'R';
+    final board = List<String>.from(state!.board);
+    board[idx] = opponentMarker;
+    state = state!.copyWith(board: board, isMyTurn: true, lastMoveIndex: idx);
+    final w = state!.checkWinner();
+    if (w != null) state = state!.copyWith(winner: w);
+  }
+
+  void reset() {
+    state = null;
+  }
+}
+
+// ===========================================================================
 // CABIN TRIVIA
 // ===========================================================================
 
